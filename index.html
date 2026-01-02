@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Live GNSS Map (MQTT + Leaflet)</title>
+
+  <!-- Leaflet -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+
+  <!-- MQTT.js -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
+  <style>
+    html, body, #map {
+      height: 100%;
+      margin: 0;
+    }
+
+    .status {
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.7);
+      color: #fff;
+      padding: 6px 12px;
+      font-family: monospace;
+      z-index: 1000;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+
+<div id="map"></div>
+<div id="status" class="status">Connecting to MQTT…</div>
+
+<script>
+  // ---------------- MQTT CONFIG ----------------
+  const mqttUrl = "wss://broker.emqx.io:8084/mqtt";
+  const mqttTopic = "robot/state";
+
+  const client = mqtt.connect(mqttUrl, {
+    clientId: "web_map_" + Math.random().toString(16).slice(2),
+    username: "imu",
+    password: "emcx_test",
+    clean: true,
+    reconnectPeriod: 2000
+  });
+
+  // ---------------- MAP INIT ----------------
+  let map = L.map('map', {
+    maxZoom: 22,
+    minZoom: 3
+  }).setView([20, 0], 3);   // world view initially
+
+  L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/' +
+    'World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 22,
+      attribution: '© Esri'
+    }
+  ).addTo(map);
+
+  let marker = null;
+  let firstFix = true;
+
+  const statusEl = document.getElementById("status");
+
+  // ---------------- MQTT EVENTS ----------------
+  client.on("connect", () => {
+    statusEl.textContent = "MQTT connected – waiting for GNSS…";
+    client.subscribe(mqttTopic);
+  });
+
+  client.on("reconnect", () => {
+    statusEl.textContent = "Reconnecting to MQTT…";
+  });
+
+  client.on("offline", () => {
+    statusEl.textContent = "MQTT offline";
+  });
+
+  client.on("message", (topic, message) => {
+    try {
+      const data = JSON.parse(message.toString());
+
+      const lat = data.gnss_lat;
+      const lon = data.gnss_lon;
+
+      // ---- GNSS NOT READY ----
+      if (lat === null || lon === null) {
+        statusEl.textContent = "Waiting for GNSS fix…";
+        return;
+      }
+
+      // ---- GNSS READY ----
+      statusEl.textContent =
+        `GNSS FIX | Lat: ${lat.toFixed(7)} Lon: ${lon.toFixed(7)}`;
+
+      if (!marker) {
+        marker = L.marker([lat, lon]).addTo(map);
+      } else {
+        marker.setLatLng([lat, lon]);
+      }
+
+      if (firstFix) {
+        map.setView([lat, lon], 19);
+        firstFix = false;
+      } else {
+        map.panTo([lat, lon], { animate: true });
+      }
+
+    } catch (e) {
+      console.error("Invalid MQTT message", e);
+    }
+  });
+</script>
+
+</body>
+</html>
