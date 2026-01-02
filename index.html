@@ -1,143 +1,377 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<title>Live GNSS Map</title>
-
-<!-- Leaflet -->
-<link
-  rel="stylesheet"
-  href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-/>
-
-<!-- MQTT.js -->
-<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
-
-<style>
-html, body, #map {
-  height: 100%;
-  margin: 0;
-}
-
-.status {
-  position: absolute;
-  top: 10px;
-  left: 50%;
-  transform: translateX(-50%);
-  background: rgba(0,0,0,0.75);
-  color: #fff;
-  padding: 6px 12px;
-  font-family: monospace;
-  z-index: 1000;
-  border-radius: 4px;
-}
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vehicle Tracker</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+        }
+        #container {
+            display: flex;
+            height: 100vh;
+        }
+        #map {
+            flex: 1;
+            position: relative;
+        }
+        #sidebar {
+            width: 320px;
+            background: #16213e;
+            padding: 20px;
+            overflow-y: auto;
+            box-shadow: -2px 0 10px rgba(0,0,0,0.3);
+        }
+        h1 {
+            font-size: 24px;
+            margin-bottom: 20px;
+            color: #00d4ff;
+        }
+        .status {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+        .status.connected { background: #00ff88; }
+        .status.disconnected { background: #ff4444; }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        .data-section {
+            background: #0f1626;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+        .data-section h2 {
+            font-size: 14px;
+            color: #00d4ff;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        .data-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #1a1a2e;
+        }
+        .data-row:last-child {
+            border-bottom: none;
+        }
+        .label {
+            color: #888;
+            font-size: 13px;
+        }
+        .value {
+            color: #fff;
+            font-weight: 600;
+            font-size: 13px;
+        }
+        .controls {
+            margin-top: 20px;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            margin-bottom: 10px;
+            background: #00d4ff;
+            color: #16213e;
+            border: none;
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        button:hover {
+            background: #00b8e6;
+            transform: translateY(-2px);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        .layer-toggle {
+            display: flex;
+            gap: 10px;
+        }
+        .layer-toggle button {
+            flex: 1;
+        }
+        .layer-toggle button.active {
+            background: #00ff88;
+        }
+        #compass {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 80px;
+            height: 80px;
+            background: rgba(22, 33, 62, 0.9);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            z-index: 1000;
+        }
+        #compass-arrow {
+            width: 0;
+            height: 0;
+            border-left: 15px solid transparent;
+            border-right: 15px solid transparent;
+            border-bottom: 40px solid #ff4444;
+            transition: transform 0.3s ease;
+        }
+    </style>
 </head>
-
 <body>
+    <div id="container">
+        <div id="map">
+            <div id="compass">
+                <div id="compass-arrow"></div>
+            </div>
+        </div>
+        <div id="sidebar">
+            <h1>🚗 Vehicle Tracker</h1>
+            <div style="margin-bottom: 20px;">
+                <span class="status disconnected" id="status"></span>
+                <span id="status-text">Connecting...</span>
+            </div>
 
-<div id="map"></div>
-<div id="status" class="status">Starting…</div>
+            <div class="data-section">
+                <h2>📍 Location</h2>
+                <div class="data-row">
+                    <span class="label">Latitude</span>
+                    <span class="value" id="lat">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Longitude</span>
+                    <span class="value" id="lon">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Altitude</span>
+                    <span class="value" id="alt">--</span>
+                </div>
+            </div>
 
-<script>
-/* ---------------- CONFIG ---------------- */
-const MQTT_URL   = "wss://broker.emqx.io:8084/mqtt";
-const MQTT_TOPIC = "robot/state";
-/* --------------------------------------- */
+            <div class="data-section">
+                <h2>🛰️ GNSS Status</h2>
+                <div class="data-row">
+                    <span class="label">Fix Quality</span>
+                    <span class="value" id="fix">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Satellites</span>
+                    <span class="value" id="sats">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">HDOP</span>
+                    <span class="value" id="hdop">--</span>
+                </div>
+            </div>
 
-const statusEl = document.getElementById("status");
+            <div class="data-section">
+                <h2>🧭 IMU Data</h2>
+                <div class="data-row">
+                    <span class="label">Heading</span>
+                    <span class="value" id="heading">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Accel (X/Y/Z)</span>
+                    <span class="value" id="accel">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Gyro (X/Y/Z)</span>
+                    <span class="value" id="gyro">--</span>
+                </div>
+            </div>
 
-/* ---------------- MAP INIT ---------------- */
-const map = L.map("map", {
-  minZoom: 3,
-  maxZoom: 22
-});
+            <div class="controls">
+                <button onclick="centerVehicle()">📍 Center on Vehicle</button>
+                <div class="layer-toggle">
+                    <button id="btn-street" class="active" onclick="setLayer('street')">Street</button>
+                    <button id="btn-satellite" onclick="setLayer('satellite')">Satellite</button>
+                    <button id="btn-hybrid" onclick="setLayer('hybrid')">Hybrid</button>
+                </div>
+            </div>
 
-// Try to restore last known position
-const lastLat = Number(localStorage.getItem("last_lat"));
-const lastLon = Number(localStorage.getItem("last_lon"));
+            <div class="data-section" style="margin-top: 20px;">
+                <h2>ℹ️ Info</h2>
+                <div class="data-row">
+                    <span class="label">Sequence</span>
+                    <span class="value" id="seq">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Last Update</span>
+                    <span class="value" id="timestamp">--</span>
+                </div>
+            </div>
+        </div>
+    </div>
 
-if (Number.isFinite(lastLat) && Number.isFinite(lastLon)) {
-  map.setView([lastLat, lastLon], 16);
-} else {
-  map.setView([20, 0], 3); // world view
-}
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+    <script>
+        // Initialize map
+        const map = L.map('map').setView([17.4698, 78.5966], 18);
+        
+        // Layer definitions
+        const layers = {
+            street: L.tileLayer('https://{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', {
+                maxZoom: 20,
+                subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+                attribution: '© Google Maps'
+            }),
+            satellite: L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+                maxZoom: 20,
+                subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+                attribution: '© Google Maps'
+            }),
+            hybrid: L.tileLayer('https://{s}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', {
+                maxZoom: 20,
+                subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+                attribution: '© Google Maps'
+            })
+        };
 
-L.tileLayer(
-  "https://server.arcgisonline.com/ArcGIS/rest/services/" +
-  "World_Imagery/MapServer/tile/{z}/{y}/{x}",
-  { maxZoom: 22 }
-).addTo(map);
+        let currentLayer = 'street';
+        layers.street.addTo(map);
 
-let marker = null;
-let firstFix = true;
+        // Vehicle marker with heading arrow
+        let vehicleMarker = null;
+        let vehiclePosition = null;
+        let currentHeading = 0;
 
-/* ---------------- MQTT ---------------- */
-const client = mqtt.connect(MQTT_URL, {
-  clientId: "web_map_" + Math.random().toString(16).slice(2),
-  clean: true,
-  reconnectPeriod: 2000
-});
+        function createVehicleIcon(heading) {
+            return L.divIcon({
+                html: `
+                    <div style="position: relative; width: 40px; height: 40px;">
+                        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(${heading}deg); width: 0; height: 0; border-left: 12px solid transparent; border-right: 12px solid transparent; border-bottom: 30px solid #00ff88; filter: drop-shadow(0 0 8px rgba(0,255,136,0.8));"></div>
+                        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 12px; height: 12px; background: #fff; border: 2px solid #00ff88; border-radius: 50%;"></div>
+                    </div>
+                `,
+                className: '',
+                iconSize: [40, 40],
+                iconAnchor: [20, 20]
+            });
+        }
 
-client.on("connect", () => {
-  console.log("✅ MQTT connected");
-  statusEl.textContent = "MQTT connected – waiting for GNSS fix…";
-  client.subscribe(MQTT_TOPIC);
-});
+        // MQTT Connection - Using WebSocket path
+        const client = new Paho.MQTT.Client('broker.emqx.io', 8084, '/mqtt', 'web_client_' + Math.random().toString(16).substr(2, 8));
 
-client.on("reconnect", () => {
-  statusEl.textContent = "Reconnecting to MQTT…";
-});
+        client.onConnectionLost = (responseObject) => {
+            console.log('Connection lost:', responseObject.errorMessage);
+            document.getElementById('status').className = 'status disconnected';
+            document.getElementById('status-text').textContent = 'Disconnected';
+        };
 
-client.on("offline", () => {
-  statusEl.textContent = "MQTT offline";
-});
+        client.onMessageArrived = (message) => {
+            try {
+                const data = JSON.parse(message.payloadString);
+                updateUI(data);
+                updateMap(data);
+            } catch (e) {
+                console.error('Parse error:', e);
+            }
+        };
 
-client.on("error", err => {
-  console.error("MQTT error:", err);
-  statusEl.textContent = "MQTT error – check console";
-});
+        const connectOptions = {
+            useSSL: true,
+            userName: 'imu',
+            password: 'emcx_test',
+            onSuccess: () => {
+                console.log('Connected to MQTT');
+                document.getElementById('status').className = 'status connected';
+                document.getElementById('status-text').textContent = 'Connected';
+                client.subscribe('robot/state');
+            },
+            onFailure: (err) => {
+                console.error('Connection failed:', err);
+                document.getElementById('status-text').textContent = 'Connection Failed';
+            }
+        };
 
-/* ---------------- DATA HANDLER ---------------- */
-client.on("message", (topic, message) => {
-  let data;
-  try {
-    data = JSON.parse(message.toString());
-  } catch (e) {
-    console.error("JSON parse error", e);
-    return;
-  }
+        client.connect(connectOptions);
 
-  const lat = Number(data.gnss_lat);
-  const lon = Number(data.gnss_lon);
+        function updateUI(data) {
+            document.getElementById('lat').textContent = data.gnss_lat?.toFixed(6) || '--';
+            document.getElementById('lon').textContent = data.gnss_lon?.toFixed(6) || '--';
+            document.getElementById('alt').textContent = data.gnss_alt ? data.gnss_alt.toFixed(2) + ' m' : '--';
+            
+            const fixTypes = ['No Fix', 'GPS', 'DGPS', 'PPS', 'RTK', 'Float RTK'];
+            document.getElementById('fix').textContent = data.gnss_fix ? fixTypes[data.gnss_fix] || data.gnss_fix : '--';
+            document.getElementById('sats').textContent = data.gnss_sats || '--';
+            document.getElementById('hdop').textContent = data.gnss_hdop?.toFixed(1) || '--';
+            
+            document.getElementById('heading').textContent = data.imu_heading ? data.imu_heading.toFixed(1) + '°' : '--';
+            document.getElementById('accel').textContent = (data.imu_ax != null) ? 
+                `${data.imu_ax.toFixed(2)} / ${data.imu_ay.toFixed(2)} / ${data.imu_az.toFixed(2)}` : '--';
+            document.getElementById('gyro').textContent = (data.imu_gx != null) ?
+                `${data.imu_gx.toFixed(3)} / ${data.imu_gy.toFixed(3)} / ${data.imu_gz.toFixed(3)}` : '--';
+            
+            document.getElementById('seq').textContent = data.seq;
+            document.getElementById('timestamp').textContent = new Date(data.timestamp * 1000).toLocaleTimeString();
 
-  // -------- GNSS NOT READY (MSP / WARM-UP) --------
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    statusEl.textContent =
-      "GNSS warming up (acquiring satellites)…";
-    return;
-  }
+            // Update compass
+            if (data.imu_heading != null) {
+                document.getElementById('compass-arrow').style.transform = `rotate(${data.imu_heading}deg)`;
+            }
+        }
 
-  // Save last good fix
-  localStorage.setItem("last_lat", lat);
-  localStorage.setItem("last_lon", lon);
+        function updateMap(data) {
+            if (data.gnss_lat != null && data.gnss_lon != null) {
+                vehiclePosition = [data.gnss_lat, data.gnss_lon];
+                
+                // Update heading if available
+                if (data.imu_heading != null) {
+                    currentHeading = data.imu_heading;
+                }
+                
+                if (vehicleMarker) {
+                    vehicleMarker.setLatLng(vehiclePosition);
+                    vehicleMarker.setIcon(createVehicleIcon(currentHeading));
+                } else {
+                    vehicleMarker = L.marker(vehiclePosition, { 
+                        icon: createVehicleIcon(currentHeading) 
+                    }).addTo(map);
+                    map.setView(vehiclePosition, 18);
+                }
+            }
+        }
 
-  // -------- GNSS READY --------
-  statusEl.textContent =
-    `GNSS FIX | ${lat.toFixed(7)}, ${lon.toFixed(7)}`;
+        function centerVehicle() {
+            if (vehiclePosition) {
+                map.setView(vehiclePosition, 18);
+            }
+        }
 
-  if (!marker) {
-    // First fix → create marker and center map
-    marker = L.marker([lat, lon]).addTo(map);
-    map.setView([lat, lon], 19);
-    firstFix = false;
-  } else {
-    // Update marker position
-    marker.setLatLng([lat, lon]);
-    map.panTo([lat, lon], { animate: true });
-  }
-});
-</script>
-
+        function setLayer(layerName) {
+            // Remove current layer
+            map.removeLayer(layers[currentLayer]);
+            
+            // Add new layer
+            currentLayer = layerName;
+            layers[layerName].addTo(map);
+            
+            // Update button states
+            document.getElementById('btn-street').classList.remove('active');
+            document.getElementById('btn-satellite').classList.remove('active');
+            document.getElementById('btn-hybrid').classList.remove('active');
+            document.getElementById('btn-' + layerName).classList.add('active');
+        }
+    </script>
 </body>
 </html>
