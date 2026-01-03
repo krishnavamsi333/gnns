@@ -1,377 +1,392 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vehicle Tracker</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: #1a1a2e;
-            color: #eee;
-        }
-        #container {
-            display: flex;
-            height: 100vh;
-        }
-        #map {
-            flex: 1;
-            position: relative;
-        }
-        #sidebar {
-            width: 320px;
-            background: #16213e;
-            padding: 20px;
-            overflow-y: auto;
-            box-shadow: -2px 0 10px rgba(0,0,0,0.3);
-        }
-        h1 {
-            font-size: 24px;
-            margin-bottom: 20px;
-            color: #00d4ff;
-        }
-        .status {
-            display: inline-block;
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            margin-right: 8px;
-            animation: pulse 2s infinite;
-        }
-        .status.connected { background: #00ff88; }
-        .status.disconnected { background: #ff4444; }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-        .data-section {
-            background: #0f1626;
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 15px;
-        }
-        .data-section h2 {
-            font-size: 14px;
-            color: #00d4ff;
-            margin-bottom: 10px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-        .data-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 8px 0;
-            border-bottom: 1px solid #1a1a2e;
-        }
-        .data-row:last-child {
-            border-bottom: none;
-        }
-        .label {
-            color: #888;
-            font-size: 13px;
-        }
-        .value {
-            color: #fff;
-            font-weight: 600;
-            font-size: 13px;
-        }
-        .controls {
-            margin-top: 20px;
-        }
-        button {
-            width: 100%;
-            padding: 12px;
-            margin-bottom: 10px;
-            background: #00d4ff;
-            color: #16213e;
-            border: none;
-            border-radius: 6px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-        button:hover {
-            background: #00b8e6;
-            transform: translateY(-2px);
-        }
-        button:active {
-            transform: translateY(0);
-        }
-        .layer-toggle {
-            display: flex;
-            gap: 10px;
-        }
-        .layer-toggle button {
-            flex: 1;
-        }
-        .layer-toggle button.active {
-            background: #00ff88;
-        }
-        #compass {
-            position: absolute;
-            top: 20px;
-            right: 20px;
-            width: 80px;
-            height: 80px;
-            background: rgba(22, 33, 62, 0.9);
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
-            z-index: 1000;
-        }
-        #compass-arrow {
-            width: 0;
-            height: 0;
-            border-left: 15px solid transparent;
-            border-right: 15px solid transparent;
-            border-bottom: 40px solid #ff4444;
-            transition: transform 0.3s ease;
-        }
-    </style>
-</head>
-<body>
-    <div id="container">
-        <div id="map">
-            <div id="compass">
-                <div id="compass-arrow"></div>
-            </div>
-        </div>
-        <div id="sidebar">
-            <h1>🚗 Vehicle Tracker</h1>
-            <div style="margin-bottom: 20px;">
-                <span class="status disconnected" id="status"></span>
-                <span id="status-text">Connecting...</span>
-            </div>
+#!/usr/bin/env python3
+"""
+Vehicle State Estimator with Sensor Fusion
+IMU (BNO085) + GNSS (UM981) → Reliable Position & Heading
 
-            <div class="data-section">
-                <h2>📍 Location</h2>
-                <div class="data-row">
-                    <span class="label">Latitude</span>
-                    <span class="value" id="lat">--</span>
-                </div>
-                <div class="data-row">
-                    <span class="label">Longitude</span>
-                    <span class="value" id="lon">--</span>
-                </div>
-                <div class="data-row">
-                    <span class="label">Altitude</span>
-                    <span class="value" id="alt">--</span>
-                </div>
-            </div>
+APPROACH:
+- Position: GNSS primary, IMU dead-reckoning backup
+- Heading: GNSS course when moving, IMU magnetometer when stationary
+- Complementary filter for smooth fusion
+- Outlier rejection and quality scoring
+"""
 
-            <div class="data-section">
-                <h2>🛰️ GNSS Status</h2>
-                <div class="data-row">
-                    <span class="label">Fix Quality</span>
-                    <span class="value" id="fix">--</span>
-                </div>
-                <div class="data-row">
-                    <span class="label">Satellites</span>
-                    <span class="value" id="sats">--</span>
-                </div>
-                <div class="data-row">
-                    <span class="label">HDOP</span>
-                    <span class="value" id="hdop">--</span>
-                </div>
-            </div>
+import time
+import json
+import math
+import logging
+import signal
+import serial
+import pynmea2
+import paho.mqtt.client as mqtt
+from collections import deque
 
-            <div class="data-section">
-                <h2>🧭 IMU Data</h2>
-                <div class="data-row">
-                    <span class="label">Heading</span>
-                    <span class="value" id="heading">--</span>
-                </div>
-                <div class="data-row">
-                    <span class="label">Accel (X/Y/Z)</span>
-                    <span class="value" id="accel">--</span>
-                </div>
-                <div class="data-row">
-                    <span class="label">Gyro (X/Y/Z)</span>
-                    <span class="value" id="gyro">--</span>
-                </div>
-            </div>
+from adafruit_blinka.microcontroller.generic_linux.i2c import I2C as LinuxI2C
+from adafruit_bno08x.i2c import BNO08X_I2C
+from adafruit_bno08x import (
+    BNO_REPORT_ACCELEROMETER,
+    BNO_REPORT_GYROSCOPE,
+    BNO_REPORT_MAGNETOMETER,
+    BNO_REPORT_ROTATION_VECTOR,
+)
 
-            <div class="controls">
-                <button onclick="centerVehicle()">📍 Center on Vehicle</button>
-                <div class="layer-toggle">
-                    <button id="btn-street" class="active" onclick="setLayer('street')">Street</button>
-                    <button id="btn-satellite" onclick="setLayer('satellite')">Satellite</button>
-                    <button id="btn-hybrid" onclick="setLayer('hybrid')">Hybrid</button>
-                </div>
-            </div>
+# ============== CONFIG ==============
+MQTT_HOST = "broker.emqx.io"
+MQTT_PORT = 1883
+MQTT_TOPIC = "robot/fused_state"
+MQTT_USER = "imu"
+MQTT_PASS = "emcx_test"
 
-            <div class="data-section" style="margin-top: 20px;">
-                <h2>ℹ️ Info</h2>
-                <div class="data-row">
-                    <span class="label">Sequence</span>
-                    <span class="value" id="seq">--</span>
-                </div>
-                <div class="data-row">
-                    <span class="label">Last Update</span>
-                    <span class="value" id="timestamp">--</span>
-                </div>
-            </div>
-        </div>
-    </div>
+IMU_RATE_HZ = 20
+PUBLISH_HZ = 10
 
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
-    <script>
-        // Initialize map
-        const map = L.map('map').setView([17.4698, 78.5966], 18);
+# GNSS
+SERIAL_PORT = "/dev/ttyAMA4"
+SERIAL_BAUD = 115200
+MIN_GNSS_QUALITY = 1  # 1=GPS, 4=RTK fixed
+MIN_SATELLITES = 4
+
+# Heading fusion
+MOVING_SPEED_THRESHOLD = 1.0  # m/s (trust GNSS course above this)
+IMU_YAW_OFFSET_DEG = 222.0    # your calibrated mounting offset
+MAG_TRUST_WEIGHT = 0.3        # when stationary, trust mag at 30%
+
+# Position fusion
+MAX_GNSS_AGE = 5.0  # seconds before falling back to dead reckoning
+# =====================================
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("fusion")
+
+# ============== I2C FIX ==============
+class LinuxI2CCompat(LinuxI2C):
+    def try_lock(self): return True
+    def unlock(self): pass
+
+# ============== MQTT ==============
+class MQTTPublisher:
+    def __init__(self):
+        self.client = mqtt.Client(
+            client_id="vehicle_fusion_pi",
+            protocol=mqtt.MQTTv311,
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION1
+        )
+        self.client.username_pw_set(MQTT_USER, MQTT_PASS)
+        self.client.connect(MQTT_HOST, MQTT_PORT, 30)
+        self.client.loop_start()
+        logger.info("MQTT connected")
+
+    def publish(self, payload):
+        self.client.publish(MQTT_TOPIC, json.dumps(payload), qos=0)
+
+    def shutdown(self):
+        self.client.loop_stop()
+        self.client.disconnect()
+
+# ============== GNSS ==============
+class GNSS:
+    def __init__(self):
+        self.ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.05)
+        self.buffer = bytearray()
+        self.last_fix = None
+        self.last_valid_time = None
+        logger.info("GNSS online")
+
+    def read_stream(self):
+        data = self.ser.read(256)
+        if not data:
+            return
+        self.buffer.extend(data)
+
+        while b"\n" in self.buffer:
+            line_bytes, _, self.buffer = self.buffer.partition(b"\n")
+            line = line_bytes.decode("ascii", errors="ignore").strip()
+
+            if not line.startswith("$") or "*" not in line:
+                continue
+            if not (line.startswith("$GNGGA") or line.startswith("$GPGGA")):
+                continue
+
+            try:
+                msg = pynmea2.parse(line)
+            except:
+                continue
+
+            if msg.gps_qual < MIN_GNSS_QUALITY or msg.num_sats < MIN_SATELLITES:
+                continue
+
+            self.last_fix = {
+                "lat": float(msg.latitude),
+                "lon": float(msg.longitude),
+                "alt": float(msg.altitude),
+                "fix": int(msg.gps_qual),
+                "sats": int(msg.num_sats),
+                "hdop": float(msg.horizontal_dil),
+            }
+            self.last_valid_time = time.time()
+
+    def get_fix(self):
+        if not self.last_fix:
+            return None
+        age = time.time() - self.last_valid_time if self.last_valid_time else 999
+        if age > MAX_GNSS_AGE:
+            return None  # stale
+        return {**self.last_fix, "age": age}
+
+# ============== IMU ==============
+class IMU:
+    def __init__(self):
+        self.i2c = LinuxI2CCompat(0)
+        self.bno = BNO08X_I2C(self.i2c)
+
+        # -------- IMU OFFSETS (SUBTRACTED) --------
+        # Uncomment and calibrate these for your setup:
+        self.accel_offset = [0.0, 0.0, 0.0]   # m/s²
+        self.gyro_offset  = [0.0, 0.0, 0.0]   # rad/s
+        self.mag_offset   = [0.0, 0.0, 0.0]   # uT (hard-iron)
         
-        // Layer definitions
-        const layers = {
-            street: L.tileLayer('https://{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', {
-                maxZoom: 20,
-                subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
-                attribution: '© Google Maps'
-            }),
-            satellite: L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
-                maxZoom: 20,
-                subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
-                attribution: '© Google Maps'
-            }),
-            hybrid: L.tileLayer('https://{s}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', {
-                maxZoom: 20,
-                subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
-                attribution: '© Google Maps'
-            })
-        };
+        # Example calibrated values (from your first script):
+        # self.accel_offset = [0.24, -0.46, -0.20]
+        # self.gyro_offset  = [0.0, 0.0, 0.0]
+        # self.mag_offset   = [-9.8, -85.0, -13.0]
 
-        let currentLayer = 'street';
-        layers.street.addTo(map);
+        us = int(1_000_000 / IMU_RATE_HZ)
+        self.bno.enable_feature(BNO_REPORT_ACCELEROMETER, us)
+        self.bno.enable_feature(BNO_REPORT_GYROSCOPE, us)
+        self.bno.enable_feature(BNO_REPORT_MAGNETOMETER, us)
+        self.bno.enable_feature(BNO_REPORT_ROTATION_VECTOR, us)
 
-        // Vehicle marker with heading arrow
-        let vehicleMarker = null;
-        let vehiclePosition = null;
-        let currentHeading = 0;
+        logger.info("IMU online (9-axis)")
 
-        function createVehicleIcon(heading) {
-            return L.divIcon({
-                html: `
-                    <div style="position: relative; width: 40px; height: 40px;">
-                        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(${heading}deg); width: 0; height: 0; border-left: 12px solid transparent; border-right: 12px solid transparent; border-bottom: 30px solid #00ff88; filter: drop-shadow(0 0 8px rgba(0,255,136,0.8));"></div>
-                        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 12px; height: 12px; background: #fff; border: 2px solid #00ff88; border-radius: 50%;"></div>
-                    </div>
-                `,
-                className: '',
-                iconSize: [40, 40],
-                iconAnchor: [20, 20]
-            });
+    @staticmethod
+    def quat_to_heading(q):
+        """Convert quaternion to compass heading (0-360°, N=0)"""
+        qx, qy, qz, qw = q
+        yaw = math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+        compass = (90 - math.degrees(yaw)) % 360
+        return (compass + IMU_YAW_OFFSET_DEG) % 360
+
+    @staticmethod
+    def _apply_offset(vec, offset):
+        """Subtract calibration offset from sensor reading"""
+        if not vec:
+            return vec
+        return tuple(v - o for v, o in zip(vec, offset))
+
+    def read(self):
+        quat = self.bno.quaternion
+        accel = self._apply_offset(self.bno.acceleration, self.accel_offset)
+        gyro = self._apply_offset(self.bno.gyro, self.gyro_offset)
+        mag = self._apply_offset(self.bno.magnetic, self.mag_offset)
+
+        return {
+            "quat": quat,
+            "heading_mag": round(self.quat_to_heading(quat), 2) if quat else None,
+            "accel": accel,
+            "gyro": gyro,
+            "mag": mag,
         }
 
-        // MQTT Connection - Using WebSocket path
-        const client = new Paho.MQTT.Client('broker.emqx.io', 8084, '/mqtt', 'web_client_' + Math.random().toString(16).substr(2, 8));
+# ============== VELOCITY ESTIMATOR ==============
+class VelocityEstimator:
+    """Estimate velocity from position history"""
+    def __init__(self, window=5):
+        self.history = deque(maxlen=window)
 
-        client.onConnectionLost = (responseObject) => {
-            console.log('Connection lost:', responseObject.errorMessage);
-            document.getElementById('status').className = 'status disconnected';
-            document.getElementById('status-text').textContent = 'Disconnected';
-        };
+    def update(self, lat, lon, timestamp):
+        self.history.append((lat, lon, timestamp))
 
-        client.onMessageArrived = (message) => {
-            try {
-                const data = JSON.parse(message.payloadString);
-                updateUI(data);
-                updateMap(data);
-            } catch (e) {
-                console.error('Parse error:', e);
-            }
-        };
+    def get_speed(self):
+        if len(self.history) < 2:
+            return 0.0
+        
+        lat1, lon1, t1 = self.history[0]
+        lat2, lon2, t2 = self.history[-1]
+        dt = t2 - t1
+        
+        if dt < 0.1:
+            return 0.0
+        
+        # Haversine distance
+        R = 6371000  # Earth radius in meters
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+        dist = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        
+        return dist / dt
 
-        const connectOptions = {
-            useSSL: true,
-            userName: 'imu',
-            password: 'emcx_test',
-            onSuccess: () => {
-                console.log('Connected to MQTT');
-                document.getElementById('status').className = 'status connected';
-                document.getElementById('status-text').textContent = 'Connected';
-                client.subscribe('robot/state');
-            },
-            onFailure: (err) => {
-                console.error('Connection failed:', err);
-                document.getElementById('status-text').textContent = 'Connection Failed';
-            }
-        };
+    def get_course(self):
+        """GNSS course over ground (bearing between positions)"""
+        if len(self.history) < 2:
+            return None
+        
+        lat1, lon1, _ = self.history[-2]
+        lat2, lon2, _ = self.history[-1]
+        
+        dlon = math.radians(lon2 - lon1)
+        lat1_r = math.radians(lat1)
+        lat2_r = math.radians(lat2)
+        
+        y = math.sin(dlon) * math.cos(lat2_r)
+        x = math.cos(lat1_r) * math.sin(lat2_r) - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(dlon)
+        bearing = (math.degrees(math.atan2(y, x)) + 360) % 360
+        
+        return bearing
 
-        client.connect(connectOptions);
+# ============== HEADING FUSION ==============
+class HeadingFusion:
+    """Fuse IMU magnetometer + GNSS course"""
+    def __init__(self):
+        self.fused_heading = None
 
-        function updateUI(data) {
-            document.getElementById('lat').textContent = data.gnss_lat?.toFixed(6) || '--';
-            document.getElementById('lon').textContent = data.gnss_lon?.toFixed(6) || '--';
-            document.getElementById('alt').textContent = data.gnss_alt ? data.gnss_alt.toFixed(2) + ' m' : '--';
+    def update(self, imu_heading, gnss_course, speed):
+        if gnss_course is None and imu_heading is None:
+            return self.fused_heading
+
+        # Decide weights based on speed
+        if speed > MOVING_SPEED_THRESHOLD:
+            # Trust GNSS course heavily when moving
+            gnss_weight = 0.9
+        else:
+            # Trust magnetometer more when stationary
+            gnss_weight = 1.0 - MAG_TRUST_WEIGHT
+
+        # Circular mean (handle 359°/1° wraparound)
+        if gnss_course is not None and imu_heading is not None:
+            gnss_rad = math.radians(gnss_course)
+            imu_rad = math.radians(imu_heading)
             
-            const fixTypes = ['No Fix', 'GPS', 'DGPS', 'PPS', 'RTK', 'Float RTK'];
-            document.getElementById('fix').textContent = data.gnss_fix ? fixTypes[data.gnss_fix] || data.gnss_fix : '--';
-            document.getElementById('sats').textContent = data.gnss_sats || '--';
-            document.getElementById('hdop').textContent = data.gnss_hdop?.toFixed(1) || '--';
+            x = gnss_weight * math.cos(gnss_rad) + (1-gnss_weight) * math.cos(imu_rad)
+            y = gnss_weight * math.sin(gnss_rad) + (1-gnss_weight) * math.sin(imu_rad)
             
-            document.getElementById('heading').textContent = data.imu_heading ? data.imu_heading.toFixed(1) + '°' : '--';
-            document.getElementById('accel').textContent = (data.imu_ax != null) ? 
-                `${data.imu_ax.toFixed(2)} / ${data.imu_ay.toFixed(2)} / ${data.imu_az.toFixed(2)}` : '--';
-            document.getElementById('gyro').textContent = (data.imu_gx != null) ?
-                `${data.imu_gx.toFixed(3)} / ${data.imu_gy.toFixed(3)} / ${data.imu_gz.toFixed(3)}` : '--';
+            fused = (math.degrees(math.atan2(y, x)) + 360) % 360
+        elif gnss_course is not None:
+            fused = gnss_course
+        elif imu_heading is not None:
+            fused = imu_heading
+        else:
+            return self.fused_heading
+
+        # Low-pass filter for smoothness
+        if self.fused_heading is None:
+            self.fused_heading = fused
+        else:
+            # Handle wraparound
+            diff = (fused - self.fused_heading + 180) % 360 - 180
+            self.fused_heading = (self.fused_heading + 0.3 * diff) % 360
+
+        return self.fused_heading
+
+# ============== MAIN ==============
+def main():
+    mqtt_pub = MQTTPublisher()
+    imu = IMU()
+    gnss = GNSS()
+    vel_est = VelocityEstimator()
+    heading_fuser = HeadingFusion()
+
+    running = True
+    signal.signal(signal.SIGTERM, lambda *_: globals().update(running=False))
+
+    publish_period = 1.0 / PUBLISH_HZ
+    next_publish = time.monotonic()
+    seq = 0
+
+    logger.info("=== Fusion loop started ===")
+
+    try:
+        while running:
+            # Read sensors continuously
+            gnss.read_stream()
+            imu_data = imu.read()
+            gnss_fix = gnss.get_fix()
             
-            document.getElementById('seq').textContent = data.seq;
-            document.getElementById('timestamp').textContent = new Date(data.timestamp * 1000).toLocaleTimeString();
+            now = time.monotonic()
+            
+            # Update velocity estimation
+            if gnss_fix:
+                vel_est.update(gnss_fix["lat"], gnss_fix["lon"], time.time())
+            
+            speed = vel_est.get_speed()
+            gnss_course = vel_est.get_course() if speed > 0.5 else None
+            
+            # Fuse heading
+            fused_heading = heading_fuser.update(
+                imu_data["heading_mag"],
+                gnss_course,
+                speed
+            )
 
-            // Update compass
-            if (data.imu_heading != null) {
-                document.getElementById('compass-arrow').style.transform = `rotate(${data.imu_heading}deg)`;
-            }
-        }
-
-        function updateMap(data) {
-            if (data.gnss_lat != null && data.gnss_lon != null) {
-                vehiclePosition = [data.gnss_lat, data.gnss_lon];
-                
-                // Update heading if available
-                if (data.imu_heading != null) {
-                    currentHeading = data.imu_heading;
+            # Position source logic
+            if gnss_fix:
+                pos_source = "gnss"
+                pos_quality = "high" if gnss_fix["fix"] >= 4 else "medium"
+                position = {
+                    "lat": gnss_fix["lat"],
+                    "lon": gnss_fix["lon"],
+                    "alt": gnss_fix["alt"],
                 }
-                
-                if (vehicleMarker) {
-                    vehicleMarker.setLatLng(vehiclePosition);
-                    vehicleMarker.setIcon(createVehicleIcon(currentHeading));
-                } else {
-                    vehicleMarker = L.marker(vehiclePosition, { 
-                        icon: createVehicleIcon(currentHeading) 
-                    }).addTo(map);
-                    map.setView(vehiclePosition, 18);
+            else:
+                pos_source = "dead_reckoning"  # Could implement DR here
+                pos_quality = "low"
+                position = None
+
+            # Heading source logic
+            if speed > MOVING_SPEED_THRESHOLD and gnss_course is not None:
+                heading_source = "gnss_course"
+                heading_quality = "high"
+            elif imu_data["heading_mag"] is not None:
+                heading_source = "imu_mag"
+                heading_quality = "medium"
+            else:
+                heading_source = "none"
+                heading_quality = "low"
+
+            # Publish at fixed rate
+            if now >= next_publish:
+                payload = {
+                    "timestamp": int(time.time()),
+                    "seq": seq,
+                    
+                    # FUSED OUTPUTS
+                    "position": position,
+                    "heading_deg": round(fused_heading, 2) if fused_heading else None,
+                    "speed_ms": round(speed, 2),
+                    
+                    # Quality indicators
+                    "pos_source": pos_source,
+                    "pos_quality": pos_quality,
+                    "heading_source": heading_source,
+                    "heading_quality": heading_quality,
+                    
+                    # Raw sensor data
+                    "gnss": gnss_fix,
+                    "imu": {
+                        "heading_mag": imu_data["heading_mag"],
+                        "accel": list(imu_data["accel"]) if imu_data["accel"] else None,
+                        "gyro": list(imu_data["gyro"]) if imu_data["gyro"] else None,
+                    },
+                    "gnss_course": round(gnss_course, 2) if gnss_course else None,
                 }
-            }
-        }
 
-        function centerVehicle() {
-            if (vehiclePosition) {
-                map.setView(vehiclePosition, 18);
-            }
-        }
+                mqtt_pub.publish(payload)
+                print(json.dumps({
+                    "pos": pos_source,
+                    "heading": heading_source,
+                    "speed": round(speed, 1),
+                    "hdg": round(fused_heading, 1) if fused_heading else None
+                }, indent=2))
+                
+                seq = (seq + 1) & 0xFFFF
+                next_publish += publish_period
 
-        function setLayer(layerName) {
-            // Remove current layer
-            map.removeLayer(layers[currentLayer]);
-            
-            // Add new layer
-            currentLayer = layerName;
-            layers[layerName].addTo(map);
-            
-            // Update button states
-            document.getElementById('btn-street').classList.remove('active');
-            document.getElementById('btn-satellite').classList.remove('active');
-            document.getElementById('btn-hybrid').classList.remove('active');
-            document.getElementById('btn-' + layerName).classList.add('active');
-        }
-    </script>
-</body>
-</html>
+            time.sleep(0.001)
+
+    except KeyboardInterrupt:
+        logger.info("Ctrl+C received")
+    finally:
+        mqtt_pub.shutdown()
+        logger.info("Shutdown complete")
+
+if __name__ == "__main__":
+    main()
