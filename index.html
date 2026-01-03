@@ -1,392 +1,696 @@
-#!/usr/bin/env python3
-"""
-Vehicle State Estimator with Sensor Fusion
-IMU (BNO085) + GNSS (UM981) → Reliable Position & Heading
-
-APPROACH:
-- Position: GNSS primary, IMU dead-reckoning backup
-- Heading: GNSS course when moving, IMU magnetometer when stationary
-- Complementary filter for smooth fusion
-- Outlier rejection and quality scoring
-"""
-
-import time
-import json
-import math
-import logging
-import signal
-import serial
-import pynmea2
-import paho.mqtt.client as mqtt
-from collections import deque
-
-from adafruit_blinka.microcontroller.generic_linux.i2c import I2C as LinuxI2C
-from adafruit_bno08x.i2c import BNO08X_I2C
-from adafruit_bno08x import (
-    BNO_REPORT_ACCELEROMETER,
-    BNO_REPORT_GYROSCOPE,
-    BNO_REPORT_MAGNETOMETER,
-    BNO_REPORT_ROTATION_VECTOR,
-)
-
-# ============== CONFIG ==============
-MQTT_HOST = "broker.emqx.io"
-MQTT_PORT = 1883
-MQTT_TOPIC = "robot/fused_state"
-MQTT_USER = "imu"
-MQTT_PASS = "emcx_test"
-
-IMU_RATE_HZ = 20
-PUBLISH_HZ = 10
-
-# GNSS
-SERIAL_PORT = "/dev/ttyAMA4"
-SERIAL_BAUD = 115200
-MIN_GNSS_QUALITY = 1  # 1=GPS, 4=RTK fixed
-MIN_SATELLITES = 4
-
-# Heading fusion
-MOVING_SPEED_THRESHOLD = 1.0  # m/s (trust GNSS course above this)
-IMU_YAW_OFFSET_DEG = 222.0    # your calibrated mounting offset
-MAG_TRUST_WEIGHT = 0.3        # when stationary, trust mag at 30%
-
-# Position fusion
-MAX_GNSS_AGE = 5.0  # seconds before falling back to dead reckoning
-# =====================================
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("fusion")
-
-# ============== I2C FIX ==============
-class LinuxI2CCompat(LinuxI2C):
-    def try_lock(self): return True
-    def unlock(self): pass
-
-# ============== MQTT ==============
-class MQTTPublisher:
-    def __init__(self):
-        self.client = mqtt.Client(
-            client_id="vehicle_fusion_pi",
-            protocol=mqtt.MQTTv311,
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION1
-        )
-        self.client.username_pw_set(MQTT_USER, MQTT_PASS)
-        self.client.connect(MQTT_HOST, MQTT_PORT, 30)
-        self.client.loop_start()
-        logger.info("MQTT connected")
-
-    def publish(self, payload):
-        self.client.publish(MQTT_TOPIC, json.dumps(payload), qos=0)
-
-    def shutdown(self):
-        self.client.loop_stop()
-        self.client.disconnect()
-
-# ============== GNSS ==============
-class GNSS:
-    def __init__(self):
-        self.ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.05)
-        self.buffer = bytearray()
-        self.last_fix = None
-        self.last_valid_time = None
-        logger.info("GNSS online")
-
-    def read_stream(self):
-        data = self.ser.read(256)
-        if not data:
-            return
-        self.buffer.extend(data)
-
-        while b"\n" in self.buffer:
-            line_bytes, _, self.buffer = self.buffer.partition(b"\n")
-            line = line_bytes.decode("ascii", errors="ignore").strip()
-
-            if not line.startswith("$") or "*" not in line:
-                continue
-            if not (line.startswith("$GNGGA") or line.startswith("$GPGGA")):
-                continue
-
-            try:
-                msg = pynmea2.parse(line)
-            except:
-                continue
-
-            if msg.gps_qual < MIN_GNSS_QUALITY or msg.num_sats < MIN_SATELLITES:
-                continue
-
-            self.last_fix = {
-                "lat": float(msg.latitude),
-                "lon": float(msg.longitude),
-                "alt": float(msg.altitude),
-                "fix": int(msg.gps_qual),
-                "sats": int(msg.num_sats),
-                "hdop": float(msg.horizontal_dil),
-            }
-            self.last_valid_time = time.time()
-
-    def get_fix(self):
-        if not self.last_fix:
-            return None
-        age = time.time() - self.last_valid_time if self.last_valid_time else 999
-        if age > MAX_GNSS_AGE:
-            return None  # stale
-        return {**self.last_fix, "age": age}
-
-# ============== IMU ==============
-class IMU:
-    def __init__(self):
-        self.i2c = LinuxI2CCompat(0)
-        self.bno = BNO08X_I2C(self.i2c)
-
-        # -------- IMU OFFSETS (SUBTRACTED) --------
-        # Uncomment and calibrate these for your setup:
-        self.accel_offset = [0.0, 0.0, 0.0]   # m/s²
-        self.gyro_offset  = [0.0, 0.0, 0.0]   # rad/s
-        self.mag_offset   = [0.0, 0.0, 0.0]   # uT (hard-iron)
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vehicle Tracker - Sensor Fusion</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0a0e27;
+            color: #e4e4e7;
+            overflow: hidden;
+        }
+        #container {
+            display: flex;
+            height: 100vh;
+        }
+        #map {
+            flex: 1;
+            position: relative;
+        }
         
-        # Example calibrated values (from your first script):
-        # self.accel_offset = [0.24, -0.46, -0.20]
-        # self.gyro_offset  = [0.0, 0.0, 0.0]
-        # self.mag_offset   = [-9.8, -85.0, -13.0]
+        /* Glassmorphism sidebar */
+        #sidebar {
+            width: 360px;
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(20px);
+            border-left: 1px solid rgba(148, 163, 184, 0.1);
+            padding: 24px;
+            overflow-y: auto;
+            box-shadow: -8px 0 32px rgba(0, 0, 0, 0.5);
+        }
+        
+        /* Custom scrollbar */
+        #sidebar::-webkit-scrollbar {
+            width: 6px;
+        }
+        #sidebar::-webkit-scrollbar-track {
+            background: rgba(30, 41, 59, 0.3);
+        }
+        #sidebar::-webkit-scrollbar-thumb {
+            background: rgba(100, 116, 139, 0.5);
+            border-radius: 3px;
+        }
+        
+        h1 {
+            font-size: 28px;
+            font-weight: 700;
+            margin-bottom: 24px;
+            background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+        }
+        
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 24px;
+            padding: 16px;
+            background: rgba(30, 41, 59, 0.5);
+            border-radius: 12px;
+            border: 1px solid rgba(148, 163, 184, 0.1);
+        }
+        
+        .status {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            animation: pulse 2s ease-in-out infinite;
+            box-shadow: 0 0 12px currentColor;
+        }
+        .status.connected { 
+            background: #10b981;
+            color: #10b981;
+        }
+        .status.disconnected { 
+            background: #ef4444;
+            color: #ef4444;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.6; transform: scale(1.1); }
+        }
+        
+        /* Quality badges */
+        .quality-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .quality-high { background: rgba(16, 185, 129, 0.2); color: #10b981; }
+        .quality-medium { background: rgba(251, 191, 36, 0.2); color: #fbbf24; }
+        .quality-low { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+        
+        .data-section {
+            background: rgba(30, 41, 59, 0.4);
+            border: 1px solid rgba(148, 163, 184, 0.1);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 16px;
+            transition: all 0.3s ease;
+        }
+        .data-section:hover {
+            background: rgba(30, 41, 59, 0.6);
+            border-color: rgba(148, 163, 184, 0.2);
+            transform: translateY(-2px);
+        }
+        
+        .data-section h2 {
+            font-size: 13px;
+            color: #94a3b8;
+            margin-bottom: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1.2px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .section-icon {
+            font-size: 16px;
+        }
+        
+        .data-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid rgba(51, 65, 85, 0.5);
+        }
+        .data-row:last-child {
+            border-bottom: none;
+        }
+        
+        .label {
+            color: #94a3b8;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        .value {
+            color: #f1f5f9;
+            font-weight: 600;
+            font-size: 14px;
+            font-variant-numeric: tabular-nums;
+        }
+        
+        .value.highlight {
+            color: #06b6d4;
+            font-size: 18px;
+        }
+        
+        /* Buttons */
+        .controls {
+            margin-top: 24px;
+        }
+        
+        button {
+            width: 100%;
+            padding: 14px;
+            margin-bottom: 12px;
+            background: linear-gradient(135deg, #06b6d4 0%, #3b82f6 100%);
+            color: #fff;
+            border: none;
+            border-radius: 12px;
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 12px rgba(6, 182, 212, 0.3);
+        }
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(6, 182, 212, 0.4);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        
+        .layer-toggle {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+        }
+        .layer-toggle button {
+            background: rgba(51, 65, 85, 0.5);
+            box-shadow: none;
+            font-size: 12px;
+            padding: 10px;
+        }
+        .layer-toggle button.active {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+        }
+        
+        /* Enhanced compass */
+        #compass {
+            position: absolute;
+            top: 24px;
+            right: 24px;
+            width: 100px;
+            height: 100px;
+            background: rgba(15, 23, 42, 0.9);
+            backdrop-filter: blur(20px);
+            border: 2px solid rgba(148, 163, 184, 0.2);
+            border-radius: 50%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+        }
+        
+        #compass-arrow {
+            width: 0;
+            height: 0;
+            border-left: 18px solid transparent;
+            border-right: 18px solid transparent;
+            border-bottom: 45px solid #ef4444;
+            filter: drop-shadow(0 0 12px rgba(239, 68, 68, 0.8));
+            transition: transform 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+        }
+        
+        #compass-value {
+            position: absolute;
+            bottom: 12px;
+            font-size: 11px;
+            font-weight: 700;
+            color: #06b6d4;
+            text-shadow: 0 0 8px rgba(6, 182, 212, 0.5);
+        }
+        
+        /* Speed indicator */
+        #speed-indicator {
+            position: absolute;
+            top: 140px;
+            right: 24px;
+            padding: 12px 20px;
+            background: rgba(15, 23, 42, 0.9);
+            backdrop-filter: blur(20px);
+            border: 2px solid rgba(148, 163, 184, 0.2);
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            text-align: center;
+        }
+        
+        #speed-value {
+            font-size: 28px;
+            font-weight: 700;
+            color: #10b981;
+            text-shadow: 0 0 12px rgba(16, 185, 129, 0.5);
+        }
+        
+        #speed-label {
+            font-size: 11px;
+            color: #94a3b8;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-top: 4px;
+        }
+        
+        /* Trail toggle */
+        #trail-toggle {
+            position: absolute;
+            bottom: 24px;
+            right: 24px;
+            padding: 12px 20px;
+            background: rgba(15, 23, 42, 0.9);
+            backdrop-filter: blur(20px);
+            border: 2px solid rgba(148, 163, 184, 0.2);
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        #trail-toggle:hover {
+            border-color: #06b6d4;
+            transform: translateY(-2px);
+        }
+        
+        #trail-toggle.active {
+            background: rgba(6, 182, 212, 0.2);
+            border-color: #06b6d4;
+        }
+        
+        /* Source indicator badges */
+        .source-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .source-gnss { background: rgba(6, 182, 212, 0.2); color: #06b6d4; }
+        .source-imu { background: rgba(168, 85, 247, 0.2); color: #a855f7; }
+        .source-fusion { background: rgba(34, 197, 94, 0.2); color: #22c55e; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="map">
+            <div id="compass">
+                <div id="compass-arrow"></div>
+                <div id="compass-value">0°</div>
+            </div>
+            <div id="speed-indicator">
+                <div id="speed-value">0.0</div>
+                <div id="speed-label">km/h</div>
+            </div>
+            <div id="trail-toggle" onclick="toggleTrail()">
+                🛤️ Trail: <span id="trail-status">OFF</span>
+            </div>
+        </div>
+        
+        <div id="sidebar">
+            <h1>🚗 Vehicle Tracker</h1>
+            
+            <div class="status-bar">
+                <span class="status disconnected" id="status"></span>
+                <span id="status-text" style="font-weight: 600;">Connecting...</span>
+            </div>
 
-        us = int(1_000_000 / IMU_RATE_HZ)
-        self.bno.enable_feature(BNO_REPORT_ACCELEROMETER, us)
-        self.bno.enable_feature(BNO_REPORT_GYROSCOPE, us)
-        self.bno.enable_feature(BNO_REPORT_MAGNETOMETER, us)
-        self.bno.enable_feature(BNO_REPORT_ROTATION_VECTOR, us)
+            <!-- Fused State -->
+            <div class="data-section">
+                <h2><span class="section-icon">🎯</span>Fused State</h2>
+                <div class="data-row">
+                    <span class="label">Position Quality</span>
+                    <span class="value" id="pos-quality">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Position Source</span>
+                    <span class="value" id="pos-source">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Heading Quality</span>
+                    <span class="value" id="heading-quality">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Heading Source</span>
+                    <span class="value" id="heading-source">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Speed</span>
+                    <span class="value highlight" id="speed-text">-- m/s</span>
+                </div>
+            </div>
 
-        logger.info("IMU online (9-axis)")
+            <!-- Position -->
+            <div class="data-section">
+                <h2><span class="section-icon">📍</span>Position</h2>
+                <div class="data-row">
+                    <span class="label">Latitude</span>
+                    <span class="value" id="lat">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Longitude</span>
+                    <span class="value" id="lon">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Altitude</span>
+                    <span class="value" id="alt">--</span>
+                </div>
+            </div>
 
-    @staticmethod
-    def quat_to_heading(q):
-        """Convert quaternion to compass heading (0-360°, N=0)"""
-        qx, qy, qz, qw = q
-        yaw = math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
-        compass = (90 - math.degrees(yaw)) % 360
-        return (compass + IMU_YAW_OFFSET_DEG) % 360
+            <!-- GNSS Details -->
+            <div class="data-section">
+                <h2><span class="section-icon">🛰️</span>GNSS Status</h2>
+                <div class="data-row">
+                    <span class="label">Fix Quality</span>
+                    <span class="value" id="fix">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Satellites</span>
+                    <span class="value" id="sats">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">HDOP</span>
+                    <span class="value" id="hdop">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Data Age</span>
+                    <span class="value" id="gnss-age">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">GNSS Course</span>
+                    <span class="value" id="gnss-course">--</span>
+                </div>
+            </div>
 
-    @staticmethod
-    def _apply_offset(vec, offset):
-        """Subtract calibration offset from sensor reading"""
-        if not vec:
-            return vec
-        return tuple(v - o for v, o in zip(vec, offset))
+            <!-- IMU -->
+            <div class="data-section">
+                <h2><span class="section-icon">🧭</span>IMU Data</h2>
+                <div class="data-row">
+                    <span class="label">Heading (Mag)</span>
+                    <span class="value" id="heading-mag">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Accel (m/s²)</span>
+                    <span class="value" id="accel" style="font-size: 11px;">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Gyro (rad/s)</span>
+                    <span class="value" id="gyro" style="font-size: 11px;">--</span>
+                </div>
+            </div>
 
-    def read(self):
-        quat = self.bno.quaternion
-        accel = self._apply_offset(self.bno.acceleration, self.accel_offset)
-        gyro = self._apply_offset(self.bno.gyro, self.gyro_offset)
-        mag = self._apply_offset(self.bno.magnetic, self.mag_offset)
+            <!-- Controls -->
+            <div class="controls">
+                <button onclick="centerVehicle()">📍 Center on Vehicle</button>
+                <button onclick="clearTrail()">🗑️ Clear Trail</button>
+                <div class="layer-toggle">
+                    <button id="btn-street" class="active" onclick="setLayer('street')">Street</button>
+                    <button id="btn-satellite" onclick="setLayer('satellite')">Satellite</button>
+                    <button id="btn-hybrid" onclick="setLayer('hybrid')">Hybrid</button>
+                </div>
+            </div>
 
-        return {
-            "quat": quat,
-            "heading_mag": round(self.quat_to_heading(quat), 2) if quat else None,
-            "accel": accel,
-            "gyro": gyro,
-            "mag": mag,
+            <!-- System Info -->
+            <div class="data-section" style="margin-top: 20px;">
+                <h2><span class="section-icon">ℹ️</span>System</h2>
+                <div class="data-row">
+                    <span class="label">Sequence</span>
+                    <span class="value" id="seq">--</span>
+                </div>
+                <div class="data-row">
+                    <span class="label">Last Update</span>
+                    <span class="value" id="timestamp">--</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+    <script>
+        // Initialize map
+        const map = L.map('map').setView([17.4698, 78.5966], 18);
+        
+        // Layer definitions
+        const layers = {
+            street: L.tileLayer('https://{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', {
+                maxZoom: 20,
+                subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+                attribution: '© Google Maps'
+            }),
+            satellite: L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+                maxZoom: 20,
+                subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+                attribution: '© Google Maps'
+            }),
+            hybrid: L.tileLayer('https://{s}.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', {
+                maxZoom: 20,
+                subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+                attribution: '© Google Maps'
+            })
+        };
+
+        let currentLayer = 'street';
+        layers.street.addTo(map);
+
+        // Vehicle state
+        let vehicleMarker = null;
+        let vehiclePosition = null;
+        let currentHeading = 0;
+        let trailEnabled = false;
+        let trailPoints = [];
+        let trailPolyline = null;
+
+        function createVehicleIcon(heading) {
+            return L.divIcon({
+                html: `
+                    <div style="position: relative; width: 50px; height: 50px;">
+                        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%) rotate(${heading}deg); width: 0; height: 0; border-left: 15px solid transparent; border-right: 15px solid transparent; border-bottom: 38px solid #10b981; filter: drop-shadow(0 0 12px rgba(16,185,129,0.9));"></div>
+                        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 14px; height: 14px; background: #fff; border: 3px solid #10b981; border-radius: 50%; box-shadow: 0 0 12px rgba(16,185,129,0.5);"></div>
+                    </div>
+                `,
+                className: '',
+                iconSize: [50, 50],
+                iconAnchor: [25, 25]
+            });
         }
 
-# ============== VELOCITY ESTIMATOR ==============
-class VelocityEstimator:
-    """Estimate velocity from position history"""
-    def __init__(self, window=5):
-        self.history = deque(maxlen=window)
+        // MQTT Connection
+        const client = new Paho.MQTT.Client('broker.emqx.io', 8084, '/mqtt', 'web_fusion_' + Math.random().toString(16).substr(2, 8));
 
-    def update(self, lat, lon, timestamp):
-        self.history.append((lat, lon, timestamp))
+        client.onConnectionLost = (responseObject) => {
+            console.log('Connection lost:', responseObject.errorMessage);
+            document.getElementById('status').className = 'status disconnected';
+            document.getElementById('status-text').textContent = 'Disconnected';
+        };
 
-    def get_speed(self):
-        if len(self.history) < 2:
-            return 0.0
-        
-        lat1, lon1, t1 = self.history[0]
-        lat2, lon2, t2 = self.history[-1]
-        dt = t2 - t1
-        
-        if dt < 0.1:
-            return 0.0
-        
-        # Haversine distance
-        R = 6371000  # Earth radius in meters
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-        a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
-        dist = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-        
-        return dist / dt
+        client.onMessageArrived = (message) => {
+            try {
+                const data = JSON.parse(message.payloadString);
+                updateUI(data);
+                updateMap(data);
+            } catch (e) {
+                console.error('Parse error:', e);
+            }
+        };
 
-    def get_course(self):
-        """GNSS course over ground (bearing between positions)"""
-        if len(self.history) < 2:
-            return None
-        
-        lat1, lon1, _ = self.history[-2]
-        lat2, lon2, _ = self.history[-1]
-        
-        dlon = math.radians(lon2 - lon1)
-        lat1_r = math.radians(lat1)
-        lat2_r = math.radians(lat2)
-        
-        y = math.sin(dlon) * math.cos(lat2_r)
-        x = math.cos(lat1_r) * math.sin(lat2_r) - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(dlon)
-        bearing = (math.degrees(math.atan2(y, x)) + 360) % 360
-        
-        return bearing
+        const connectOptions = {
+            useSSL: true,
+            userName: 'imu',
+            password: 'emcx_test',
+            onSuccess: () => {
+                console.log('Connected to MQTT');
+                document.getElementById('status').className = 'status connected';
+                document.getElementById('status-text').textContent = 'Connected';
+                client.subscribe('robot/fused_state');
+            },
+            onFailure: (err) => {
+                console.error('Connection failed:', err);
+                document.getElementById('status-text').textContent = 'Connection Failed';
+            }
+        };
 
-# ============== HEADING FUSION ==============
-class HeadingFusion:
-    """Fuse IMU magnetometer + GNSS course"""
-    def __init__(self):
-        self.fused_heading = None
+        client.connect(connectOptions);
 
-    def update(self, imu_heading, gnss_course, speed):
-        if gnss_course is None and imu_heading is None:
-            return self.fused_heading
+        function getQualityBadge(quality) {
+            const classes = {
+                'high': 'quality-high',
+                'medium': 'quality-medium',
+                'low': 'quality-low'
+            };
+            return `<span class="quality-badge ${classes[quality] || 'quality-low'}">${quality || 'unknown'}</span>`;
+        }
 
-        # Decide weights based on speed
-        if speed > MOVING_SPEED_THRESHOLD:
-            # Trust GNSS course heavily when moving
-            gnss_weight = 0.9
-        else:
-            # Trust magnetometer more when stationary
-            gnss_weight = 1.0 - MAG_TRUST_WEIGHT
+        function getSourceBadge(source) {
+            const badges = {
+                'gnss': '<span class="source-indicator source-gnss">🛰️ GNSS</span>',
+                'gnss_course': '<span class="source-indicator source-gnss">🛰️ GNSS Course</span>',
+                'imu_mag': '<span class="source-indicator source-imu">🧭 IMU Mag</span>',
+                'dead_reckoning': '<span class="source-indicator source-fusion">📐 Dead Reckoning</span>',
+                'fusion': '<span class="source-indicator source-fusion">⚡ Fusion</span>'
+            };
+            return badges[source] || source;
+        }
 
-        # Circular mean (handle 359°/1° wraparound)
-        if gnss_course is not None and imu_heading is not None:
-            gnss_rad = math.radians(gnss_course)
-            imu_rad = math.radians(imu_heading)
+        function updateUI(data) {
+            // Fused state
+            document.getElementById('pos-quality').innerHTML = getQualityBadge(data.pos_quality);
+            document.getElementById('pos-source').innerHTML = getSourceBadge(data.pos_source);
+            document.getElementById('heading-quality').innerHTML = getQualityBadge(data.heading_quality);
+            document.getElementById('heading-source').innerHTML = getSourceBadge(data.heading_source);
             
-            x = gnss_weight * math.cos(gnss_rad) + (1-gnss_weight) * math.cos(imu_rad)
-            y = gnss_weight * math.sin(gnss_rad) + (1-gnss_weight) * math.sin(imu_rad)
+            const speedKmh = (data.speed_ms || 0) * 3.6;
+            document.getElementById('speed-text').textContent = (data.speed_ms || 0).toFixed(2) + ' m/s';
+            document.getElementById('speed-value').textContent = speedKmh.toFixed(1);
             
-            fused = (math.degrees(math.atan2(y, x)) + 360) % 360
-        elif gnss_course is not None:
-            fused = gnss_course
-        elif imu_heading is not None:
-            fused = imu_heading
-        else:
-            return self.fused_heading
-
-        # Low-pass filter for smoothness
-        if self.fused_heading is None:
-            self.fused_heading = fused
-        else:
-            # Handle wraparound
-            diff = (fused - self.fused_heading + 180) % 360 - 180
-            self.fused_heading = (self.fused_heading + 0.3 * diff) % 360
-
-        return self.fused_heading
-
-# ============== MAIN ==============
-def main():
-    mqtt_pub = MQTTPublisher()
-    imu = IMU()
-    gnss = GNSS()
-    vel_est = VelocityEstimator()
-    heading_fuser = HeadingFusion()
-
-    running = True
-    signal.signal(signal.SIGTERM, lambda *_: globals().update(running=False))
-
-    publish_period = 1.0 / PUBLISH_HZ
-    next_publish = time.monotonic()
-    seq = 0
-
-    logger.info("=== Fusion loop started ===")
-
-    try:
-        while running:
-            # Read sensors continuously
-            gnss.read_stream()
-            imu_data = imu.read()
-            gnss_fix = gnss.get_fix()
+            // Position
+            if (data.position) {
+                document.getElementById('lat').textContent = data.position.lat?.toFixed(6) || '--';
+                document.getElementById('lon').textContent = data.position.lon?.toFixed(6) || '--';
+                document.getElementById('alt').textContent = data.position.alt ? data.position.alt.toFixed(2) + ' m' : '--';
+            } else {
+                document.getElementById('lat').textContent = '--';
+                document.getElementById('lon').textContent = '--';
+                document.getElementById('alt').textContent = '--';
+            }
             
-            now = time.monotonic()
+            // GNSS
+            if (data.gnss) {
+                const fixTypes = ['No Fix', 'GPS', 'DGPS', 'PPS', 'RTK Fixed', 'RTK Float'];
+                document.getElementById('fix').textContent = fixTypes[data.gnss.fix] || '--';
+                document.getElementById('sats').textContent = data.gnss.sats || '--';
+                document.getElementById('hdop').textContent = data.gnss.hdop?.toFixed(1) || '--';
+                document.getElementById('gnss-age').textContent = data.gnss.age ? data.gnss.age.toFixed(1) + 's' : '--';
+            } else {
+                document.getElementById('fix').textContent = '--';
+                document.getElementById('sats').textContent = '--';
+                document.getElementById('hdop').textContent = '--';
+                document.getElementById('gnss-age').textContent = '--';
+            }
             
-            # Update velocity estimation
-            if gnss_fix:
-                vel_est.update(gnss_fix["lat"], gnss_fix["lon"], time.time())
+            document.getElementById('gnss-course').textContent = data.gnss_course ? data.gnss_course.toFixed(1) + '°' : '--';
             
-            speed = vel_est.get_speed()
-            gnss_course = vel_est.get_course() if speed > 0.5 else None
+            // IMU
+            if (data.imu) {
+                document.getElementById('heading-mag').textContent = data.imu.heading_mag ? data.imu.heading_mag.toFixed(1) + '°' : '--';
+                document.getElementById('accel').textContent = data.imu.accel ? 
+                    `${data.imu.accel[0].toFixed(2)}, ${data.imu.accel[1].toFixed(2)}, ${data.imu.accel[2].toFixed(2)}` : '--';
+                document.getElementById('gyro').textContent = data.imu.gyro ?
+                    `${data.imu.gyro[0].toFixed(3)}, ${data.imu.gyro[1].toFixed(3)}, ${data.imu.gyro[2].toFixed(3)}` : '--';
+            }
             
-            # Fuse heading
-            fused_heading = heading_fuser.update(
-                imu_data["heading_mag"],
-                gnss_course,
-                speed
-            )
+            // System
+            document.getElementById('seq').textContent = data.seq;
+            document.getElementById('timestamp').textContent = new Date(data.timestamp * 1000).toLocaleTimeString();
 
-            # Position source logic
-            if gnss_fix:
-                pos_source = "gnss"
-                pos_quality = "high" if gnss_fix["fix"] >= 4 else "medium"
-                position = {
-                    "lat": gnss_fix["lat"],
-                    "lon": gnss_fix["lon"],
-                    "alt": gnss_fix["alt"],
-                }
-            else:
-                pos_source = "dead_reckoning"  # Could implement DR here
-                pos_quality = "low"
-                position = None
+            // Update compass
+            if (data.heading_deg != null) {
+                document.getElementById('compass-arrow').style.transform = `rotate(${data.heading_deg}deg)`;
+                document.getElementById('compass-value').textContent = Math.round(data.heading_deg) + '°';
+            }
+        }
 
-            # Heading source logic
-            if speed > MOVING_SPEED_THRESHOLD and gnss_course is not None:
-                heading_source = "gnss_course"
-                heading_quality = "high"
-            elif imu_data["heading_mag"] is not None:
-                heading_source = "imu_mag"
-                heading_quality = "medium"
-            else:
-                heading_source = "none"
-                heading_quality = "low"
-
-            # Publish at fixed rate
-            if now >= next_publish:
-                payload = {
-                    "timestamp": int(time.time()),
-                    "seq": seq,
-                    
-                    # FUSED OUTPUTS
-                    "position": position,
-                    "heading_deg": round(fused_heading, 2) if fused_heading else None,
-                    "speed_ms": round(speed, 2),
-                    
-                    # Quality indicators
-                    "pos_source": pos_source,
-                    "pos_quality": pos_quality,
-                    "heading_source": heading_source,
-                    "heading_quality": heading_quality,
-                    
-                    # Raw sensor data
-                    "gnss": gnss_fix,
-                    "imu": {
-                        "heading_mag": imu_data["heading_mag"],
-                        "accel": list(imu_data["accel"]) if imu_data["accel"] else None,
-                        "gyro": list(imu_data["gyro"]) if imu_data["gyro"] else None,
-                    },
-                    "gnss_course": round(gnss_course, 2) if gnss_course else None,
-                }
-
-                mqtt_pub.publish(payload)
-                print(json.dumps({
-                    "pos": pos_source,
-                    "heading": heading_source,
-                    "speed": round(speed, 1),
-                    "hdg": round(fused_heading, 1) if fused_heading else None
-                }, indent=2))
+        function updateMap(data) {
+            if (data.position && data.position.lat != null && data.position.lon != null) {
+                vehiclePosition = [data.position.lat, data.position.lon];
                 
-                seq = (seq + 1) & 0xFFFF
-                next_publish += publish_period
+                if (data.heading_deg != null) {
+                    currentHeading = data.heading_deg;
+                }
+                
+                if (vehicleMarker) {
+                    vehicleMarker.setLatLng(vehiclePosition);
+                    vehicleMarker.setIcon(createVehicleIcon(currentHeading));
+                } else {
+                    vehicleMarker = L.marker(vehiclePosition, { 
+                        icon: createVehicleIcon(currentHeading) 
+                    }).addTo(map);
+                    map.setView(vehiclePosition, 18);
+                }
+                
+                // Update trail
+                if (trailEnabled) {
+                    trailPoints.push(vehiclePosition);
+                    if (trailPoints.length > 200) {
+                        trailPoints.shift();
+                    }
+                    
+                    if (trailPolyline) {
+                        trailPolyline.setLatLngs(trailPoints);
+                    } else {
+                        trailPolyline = L.polyline(trailPoints, {
+                            color: '#06b6d4',
+                            weight: 3,
+                            opacity: 0.7,
+                            smoothFactor: 1
+                        }).addTo(map);
+                    }
+                }
+            }
+        }
 
-            time.sleep(0.001)
+        function centerVehicle() {
+            if (vehiclePosition) {
+                map.setView(vehiclePosition, 18);
+            }
+        }
 
-    except KeyboardInterrupt:
-        logger.info("Ctrl+C received")
-    finally:
-        mqtt_pub.shutdown()
-        logger.info("Shutdown complete")
+        function toggleTrail() {
+            trailEnabled = !trailEnabled;
+            document.getElementById('trail-status').textContent = trailEnabled ? 'ON' : 'OFF';
+            document.getElementById('trail-toggle').classList.toggle('active');
+            
+            if (!trailEnabled && trailPolyline) {
+                map.removeLayer(trailPolyline);
+                trailPolyline = null;
+                trailPoints = [];
+            }
+        }
 
-if __name__ == "__main__":
-    main()
+        function clearTrail() {
+            if (trailPolyline) {
+                map.removeLayer(trailPolyline);
+                trailPolyline = null;
+            }
+            trailPoints = [];
+        }
+
+        function setLayer(layerName) {
+            map.removeLayer(layers[currentLayer]);
+            currentLayer = layerName;
+            layers[layerName].addTo(map);
+            
+            document.getElementById('btn-street').classList.remove('active');
+            document.getElementById('btn-satellite').classList.remove('active');
+            document.getElementById('btn-hybrid').classList.remove('active');
+            document.getElementById('btn-' + layerName).classList.add('active');
+        }
+    </script>
+</body>
+</html>
